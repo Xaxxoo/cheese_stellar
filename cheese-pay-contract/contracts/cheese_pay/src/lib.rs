@@ -351,4 +351,246 @@ impl CheesePay {
             PAYLINK_TTL_EXTEND_TO,
         );
 
-        env.events().pu
+        env.events().publish(
+            (symbol_short!("pl_create"), creator_username),
+            (token_id, amount),
+        );
+
+        Ok(())
+    }
+
+    /// Pay a PayLink by username.
+    /// Payer can be anonymous (not a Cheese user) if paying from external
+    /// wallet — but for internal settlement, payer_username must be registered.
+    pub fn pay_paylink(
+        env:           Env,
+        payer_username: String,
+        token_id:       String,
+    ) -> Result<(), Error> {
+        Self::require_admin(&env)?;
+        Self::require_not_paused(&env)?;
+
+        Self::require_user_exists(&env, &payer_username)?;
+
+        let key  = DataKey::PayLink(token_id.clone());
+        let mut link: PayLinkData = env.storage().persistent()
+            .get(&key)
+            .ok_or(Error::PayLinkNotFound)?;
+
+        if link.paid {
+            return Err(Error::PayLinkAlreadyPaid);
+        }
+        if link.cancelled {
+            return Err(Error::PayLinkCancelled);
+        }
+        if env.ledger().sequence() > link.expiration_ledger {
+            return Err(Error::PayLinkExpired);
+        }
+
+        let fee_bps: i128 = env.storage().instance()
+            .get(&DataKey::FeeRateBps).unwrap_or(0);
+        let fee = (link.amount * fee_bps) / 10_000;
+        let net = link.amount - fee;
+
+        // Debit payer
+        let payer_key = DataKey::Balance(payer_username.clone());
+        let payer_bal = Self::read_balance(&env, &payer_key);
+        if payer_bal < link.amount {
+            return Err(Error::InsufficientBalance);
+        }
+        Self::write_balance(&env, &payer_key, payer_bal - link.amount);
+
+        // Credit creator
+        let creator_key = DataKey::Balance(link.creator_username.clone());
+        let creator_bal = Self::read_balance(&env, &creator_key);
+        Self::write_balance(&env, &creator_key, creator_bal + net);
+
+        // Fee to treasury
+        if fee > 0 {
+            let treasury: Address = env.storage().instance()
+                .get(&DataKey::FeeTreasury)
+                .ok_or(Error::NotInitialized)?;
+            let usdc = Self::usdc_client(&env);
+            usdc.transfer(
+                &env.current_contract_address(),
+                &treasury,
+                &fee,
+            );
+        }
+
+        link.paid = true;
+        env.storage().persistent().set(&key, &link);
+
+        env.events().publish(
+            (symbol_short!("pl_paid"), payer_username, link.creator_username.clone()),
+            (token_id, link.amount, fee),
+        );
+
+        Ok(())
+    }
+
+    pub fn cancel_paylink(
+        env:             Env,
+        creator_username: String,
+        token_id:         String,
+    ) -> Result<(), Error> {
+        Self::require_admin(&env)?;
+
+        let key  = DataKey::PayLink(token_id.clone());
+        let mut link: PayLinkData = env.storage().persistent()
+            .get(&key)
+            .ok_or(Error::PayLinkNotFound)?;
+
+        if link.creator_username != creator_username {
+            return Err(Error::NotPayLinkCreator);
+        }
+        if link.paid {
+            return Err(Error::PayLinkAlreadyPaid);
+        }
+        if link.cancelled {
+            return Err(Error::PayLinkCancelled);
+        }
+
+        link.cancelled = true;
+        env.storage().persistent().set(&key, &link);
+
+        env.events().publish(
+            (symbol_short!("pl_cancel"), creator_username),
+            token_id,
+        );
+
+        Ok(())
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // VIEW FUNCTIONS
+    // ─────────────────────────────────────────────────────────────────────────
+
+    pub fn balance(env: Env, username: String) -> i128 {
+        Self::read_balance(&env, &DataKey::Balance(username))
+    }
+
+    pub fn resolve_username(env: Env, username: String) -> Result<Address, Error> {
+        env.storage().persistent()
+            .get(&DataKey::UsernameToAddr(username))
+            .ok_or(Error::UsernameNotFound)
+    }
+
+    pub fn get_username(env: Env, address: Address) -> Result<String, Error> {
+        env.storage().persistent()
+            .get(&DataKey::AddrToUsername(address))
+            .ok_or(Error::UserNotFound)
+    }
+
+    pub fn get_paylink(env: Env, token_id: String) -> Result<PayLinkData, Error> {
+        env.storage().persistent()
+            .get(&DataKey::PayLink(token_id))
+            .ok_or(Error::PayLinkNotFound)
+    }
+
+    pub fn fee_rate(env: Env) -> i128 {
+        env.storage().instance()
+            .get(&DataKey::FeeRateBps).unwrap_or(0)
+    }
+
+    pub fn is_paused(env: Env) -> bool {
+        env.storage().instance()
+            .get(&DataKey::Paused).unwrap_or(false)
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // ADMIN
+    // ─────────────────────────────────────────────────────────────────────────
+
+    pub fn set_fee_rate(env: Env, new_fee_bps: i128) -> Result<(), Error> {
+        Self::require_admin(&env)?;
+        if new_fee_bps < 0 || new_fee_bps > 500 {
+            return Err(Error::FeeTooHigh);
+        }
+        env.storage().instance().set(&DataKey::FeeRateBps, &new_fee_bps);
+        env.events().publish((symbol_short!("fee_set"),), new_fee_bps);
+        Ok(())
+    }
+
+    pub fn set_fee_treasury(env: Env, new_treasury: Address) -> Result<(), Error> {
+        Self::require_admin(&env)?;
+        env.storage().instance().set(&DataKey::FeeTreasury, &new_treasury);
+        Ok(())
+    }
+
+    pub fn transfer_admin(env: Env, new_admin: Address) -> Result<(), Error> {
+        Self::require_admin(&env)?;
+        env.storage().instance().set(&DataKey::Admin, &new_admin);
+        env.events().publish((symbol_short!("adm_xfer"),), new_admin);
+        Ok(())
+    }
+
+    pub fn pause(env: Env) -> Result<(), Error> {
+        Self::require_admin(&env)?;
+        env.storage().instance().set(&DataKey::Paused, &true);
+        env.events().publish((symbol_short!("paused"),), ());
+        Ok(())
+    }
+
+    pub fn unpause(env: Env) -> Result<(), Error> {
+        Self::require_admin(&env)?;
+        env.storage().instance().set(&DataKey::Paused, &false);
+        env.events().publish((symbol_short!("unpaused"),), ());
+        Ok(())
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // PRIVATE HELPERS
+    // ─────────────────────────────────────────────────────────────────────────
+
+    fn require_not_paused(env: &Env) -> Result<(), Error> {
+        let paused: bool = env.storage().instance()
+            .get(&DataKey::Paused).unwrap_or(false);
+        if paused { Err(Error::ContractPaused) } else { Ok(()) }
+    }
+
+    fn require_admin(env: &Env) -> Result<(), Error> {
+        let admin: Address = env.storage().instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::NotInitialized)?;
+        admin.require_auth();
+        Ok(())
+    }
+
+    fn require_user_exists(env: &Env, username: &String) -> Result<(), Error> {
+        if !env.storage().persistent()
+            .has(&DataKey::UsernameToAddr(username.clone()))
+        {
+            return Err(Error::UsernameNotFound);
+        }
+        Ok(())
+    }
+
+    fn usdc_client(env: &Env) -> token::TokenClient {
+        let addr: Address = env.storage().instance()
+            .get(&DataKey::UsdcToken).unwrap();
+        token::TokenClient::new(env, &addr)
+    }
+
+    fn read_balance(env: &Env, key: &DataKey) -> i128 {
+        let balance: i128 = env.storage().persistent()
+            .get(key).unwrap_or(0);
+        if balance > 0 {
+            Self::extend_ttl_persistent(env, key);
+        }
+        balance
+    }
+
+    fn write_balance(env: &Env, key: &DataKey, amount: i128) {
+        env.storage().persistent().set(key, &amount);
+        Self::extend_ttl_persistent(env, key);
+    }
+
+    fn extend_ttl_persistent(env: &Env, key: &DataKey) {
+        env.storage().persistent().extend_ttl(
+            key,
+            LEDGER_TTL_THRESHOLD,
+            LEDGER_TTL_EXTEND_TO,
+        );
+    }
+}
