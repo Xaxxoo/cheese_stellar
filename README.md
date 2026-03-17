@@ -86,7 +86,7 @@ cheese-pay-contract/
 
 ```bash
 # 1. Clone the repo
-git clone https://github.com/xaxxoogi/cheese-stellar.git
+git clone https://github.com/xaxxoo/cheese-stellar.git
 cd cheese-pay-contract
 
 # 2. Install the WASM target (if not already done)
