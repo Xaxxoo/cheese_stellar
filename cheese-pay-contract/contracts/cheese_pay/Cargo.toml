@@ -1,5 +1,5 @@
 [package]
-name = "cheese_pay"
+name = "cheesepay"
 version = "0.1.0"
 edition = "2021"
 publish = false
